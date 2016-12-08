@@ -1,0 +1,21 @@
+#!/usr/bin/env python3
+# coding: utf-8
+# vim: et ts=4 st=4 sts=4 sw=4
+
+import sys
+from argparse import ArgumentParser
+import pureyaml
+
+
+def load_config(path):
+    with open(path, 'r', encoding='utf8') as f:
+        return pureyaml.load(f.read())
+
+def main(args):
+    ap = ArgumentParser()
+    ap.add_argument('config_file', type=str, help="Config file in yaml")
+    opts = ap.parse_args(args)
+    print(load_config(opts.config_file)['remotes'])
+    
+if __name__ == '__main__':
+    main(sys.argv[1:])

@@ -7,7 +7,7 @@ import sys
 import llfuse
 from argparse import ArgumentParser
 import errno
-import logging
+from logging import getLogger, Formatter, StreamHandler
 import stat
 from time import time
 from llfuse import FUSEError
@@ -18,7 +18,7 @@ import faulthandler
 
 
 faulthandler.enable()
-log = logging.getLogger(__name__)
+log = getLogger(__name__)
 
 
 class PhantomFile:
@@ -220,10 +220,9 @@ class Operations(llfuse.Operations):
 
 
 def init_logging(debug=False):
-    formatter = logging.Formatter('%(asctime)s.%(msecs)03d %(threadName)s: [%(name)s] %(message)s', datefmt="%Y-%m-%d %H:%M:%S")
-    handler = logging.StreamHandler()
-    handler.setFormatter(formatter)
-    root_logger = logging.getLogger()
+    handler = StreamHandler()
+    handler.setFormatter(Formatter('%(asctime)s.%(msecs)03d %(threadName)s: [%(name)s] %(message)s', datefmt="%Y-%m-%d %H:%M:%S"))
+    root_logger = getLogger()
     if debug:
         handler.setLevel(logging.DEBUG)
         root_logger.setLevel(logging.DEBUG)
