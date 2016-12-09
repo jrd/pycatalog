@@ -8,6 +8,8 @@ import llfuse
 from argparse import ArgumentParser
 import errno
 from logging import getLogger, Formatter, StreamHandler, INFO, DEBUG
+import codecs
+import gzip
 import stat
 from time import time
 from llfuse import FUSEError
@@ -44,7 +46,7 @@ class PhantomFile:
 
 
 class Operations(llfuse.Operations):
-
+    _field_sep = '|'
     _directory_mode = (stat.S_IFDIR | stat.S_IRUSR | stat.S_IXUSR | stat.S_IRGRP | stat.S_IXGRP | stat.S_IROTH | stat.S_IXOTH)
     _file_mode = (stat.S_IFREG | stat.S_IRUSR | stat.S_IRGRP | stat.S_IROTH)
     _symlink_mode = (stat.S_IFLNK | stat.S_IRUSR | stat.S_IXUSR | stat.S_IRGRP | stat.S_IXGRP | stat.S_IROTH | stat.S_IXOTH)
@@ -63,8 +65,22 @@ class Operations(llfuse.Operations):
         self._mountpoint = mountpoint
         self._notify_object = self._get_notify_object()
         self._last_notification = time()
-        self._pfiles = dict([(pf.filename, pf) for pf in [PhantomFile(*line.strip().split(':')) for line in open(lsfile, 'r').readlines()]])
-        log.debug([self._pfiles[filename] for filename in self._pfiles if '/' not in filename])
+        def mixed_decoder(uerror):
+            char = uerror.object[uerror.start:uerror.end]
+            log.debug(b'bad char :' + char)
+            new_char = None
+            for enc in 'latin1', 'cp1252':
+                try:
+                    new_char = char.decode(enc)
+                    break
+                except:
+                    pass
+            if new_char is None:
+                new_char = '?'
+            log.debug('new char :' + new_char)
+            return new_char, uerror.start + 1
+        codecs.register_error('mixed', mixed_decoder)
+        self._pfiles = dict([(pf.filename, pf) for pf in [PhantomFile(*line.strip().split(self._field_sep)) for line in gzip.open(lsfile, mode='rt', encoding='utf8', errors='mixed', newline='\n').readlines()]])
         self._last_inode = None
         self._inodes_mapping = dict()
         self._pathes_mapping = dict()

@@ -37,6 +37,7 @@ class PhantomFSProcess(Process):
 
 
 class IndexThread(Thread):
+    field_sep = '|'
     _wait_for_check_sec = 10
 
     def __init__(self, phantoms_dir, name, mount_point):
@@ -74,9 +75,9 @@ class IndexThread(Thread):
         if curr_modif <= last_modif:
             return
         log.info('indexing %s to %s' % (self._dir, self._index_file))
-        args = ['find', self._dir, '-name', '[.$]*', '-prune', '-o', '-fprintf', self._tmp_file, '%P:%y:%s\n']
+        args = r'''find "{dir}" -name '[.$]*' -prune -o -printf '%P{sep}%y{sep}%s\n' | gzip > "{out}"'''.format(dir=self._dir, sep=self.field_sep, out=self._tmp_file)
         try:
-            p = Popen(args)
+            p = Popen(args, shell=True)
             find_finished = False
             while not self._emergency_exit and not find_finished:
                 try:
@@ -240,7 +241,6 @@ def init_logging(debug=False):
         handler.setLevel(INFO)
         root_logger.setLevel(INFO)
     root_logger.addHandler(handler)
-
 
 def load_config(home_path):
     config_path = pathjoin(home_path, 'config.yaml')
