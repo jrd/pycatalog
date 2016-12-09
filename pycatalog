@@ -4,8 +4,8 @@
 
 import sys
 from argparse import ArgumentParser
+from logging import getLogger, Formatter, StreamHandler, INFO, DEBUG
 import pureyaml
-import pyinotify
 import os
 from os.path import exists, islink, realpath, join as pathjoin
 import phantomfs
@@ -15,12 +15,16 @@ import time
 from subprocess import Popen, TimeoutExpired
 
 
+log = getLogger(__name__)
+debug = False
+
+
 class PhantomFSProcess(Process):
     def __init__(self, *args):
         super().__init__(name='PhantomFS', args=args)
 
     def run(self):
-        print(self._args)
+        log.debug('mounting phantomfs with ' + str(self._args))
         phantomfs.main(self._args)
 
     def terminate(self):
@@ -33,7 +37,6 @@ class PhantomFSProcess(Process):
 
 
 class IndexThread(Thread):
-
     _wait_for_check_sec = 10
 
     def __init__(self, phantoms_dir, name, mount_point):
@@ -45,14 +48,14 @@ class IndexThread(Thread):
         self._emergency_exit = False
 
     def run(self):
-        print('index thread to %s started' % self._dir)
+        log.debug('index thread to %s started' % self._dir)
         while not self._emergency_exit:
             self._try_indexing()
             for i in range(self._wait_for_check_sec * 10):
                 time.sleep(0.1)
                 if self._emergency_exit:
                     break
-        print('index thread to %s stopped' % self._dir)
+        log.debug('index thread to %s stopped' % self._dir)
 
     def _compute_last_modif(self):
         last_modif = os.stat(pathjoin(self._dir, '.')).st_mtime_ns
@@ -70,7 +73,7 @@ class IndexThread(Thread):
         curr_modif = self._compute_last_modif()
         if curr_modif <= last_modif:
             return
-        print('indexing %s to %s' % (self._dir, self._index_file))
+        log.info('indexing %s to %s' % (self._dir, self._index_file))
         args = ['find', self._dir, '-name', '[.$]*', '-prune', '-o', '-fprintf', self._tmp_file, '%P:%y:%s\n']
         try:
             p = Popen(args)
@@ -90,7 +93,7 @@ class IndexThread(Thread):
             os.rename(self._tmp_file, self._index_file)
             with open(self._last_mod_file, 'w') as f:
                 f.write(str(curr_modif))
-            print('indexing %s done' % self._dir)
+            log.info('indexing %s done' % self._dir)
         except:
             try:
                 os.remove(self._tmp_file)
@@ -100,11 +103,9 @@ class IndexThread(Thread):
     def terminate(self):
         self._emergency_exit = True
         self.join()
-        time.sleep(1)
 
 
-class MtabHandler(pyinotify.ProcessEvent):
-    #mtab_path = '/home/cyrille/Documents/pycatalog/mtab'
+class MtabChecker:
     mtab_path = '/proc/mounts'
     mtab_field_sep = ' '
 
@@ -115,19 +116,32 @@ class MtabHandler(pyinotify.ProcessEvent):
         self._phantom_processes = {}
         self._index_threads = {}
 
-    def close(self):
+    def run(self):
+        h = 0
+        try:
+            while True:
+                try:
+                    time.sleep(1)
+                except KeyboardInterrupt:
+                    break
+                new_h = hash(open(self.mtab_path).read())
+                if new_h != h:
+                    h = new_h
+                    log.debug('mtab changed')
+                    self.check_for_remote_change()
+        finally:
+            self._close()
+
+    def _close(self):
         for (name, p) in self._phantom_processes.items():
-            print("unmounting phantom %s" % name)
+            log.debug("unmounting phantom %s" % name)
             p.terminate()
         self._phantom_processes = {}
         for (name, t) in self._index_threads.items():
-            print("killing index thread of %s" % name)
+            log.debug("killing index thread of %s" % name)
             t.terminate()
             time.sleep(0.1)
         self._index_threads = {}
-
-    def process_IN_CLOSE_WRITE(self, event):
-        self.check_for_remote_change()
 
     def check_for_remote_change(self):
         for remote in self._remotes:
@@ -139,7 +153,9 @@ class MtabHandler(pyinotify.ProcessEvent):
             elif rtype == 'local':
                 self._check_local_change(rname, rpath)
     
-    def _mount_phantomfs(self, name, debug=False):
+    def _mount_phantomfs(self, name):
+        if name in self._phantom_processes:
+            return False
         mount_point = pathjoin(self._phantoms_dir, name)
         if not exists(mount_point + '.ls'):
             return False
@@ -205,11 +221,25 @@ class MtabHandler(pyinotify.ProcessEvent):
                 return
             os.unlink(symlink)
         os.symlink(mount_point, symlink)
-        print('symlink %s → %s' % (symlink, mount_point))
+        log.info('symlink %s → %s' % (symlink, mount_point))
 
     def _index(self, name, mount_point):
-        self._index_threads[name] = IndexThread(self._phantoms_dir, name, mount_point)
-        self._index_threads[name].start()
+        if name not in self._index_threads:
+            self._index_threads[name] = IndexThread(self._phantoms_dir, name, mount_point)
+            self._index_threads[name].start()
+
+
+def init_logging(debug=False):
+    handler = StreamHandler()
+    handler.setFormatter(Formatter('%(asctime)s.%(msecs)03d %(threadName)s: [%(name)s] %(message)s', datefmt="%Y-%m-%d %H:%M:%S"))
+    root_logger = getLogger()
+    if debug:
+        handler.setLevel(DEBUG)
+        root_logger.setLevel(DEBUG)
+    else:
+        handler.setLevel(INFO)
+        root_logger.setLevel(INFO)
+    root_logger.addHandler(handler)
 
 
 def load_config(home_path):
@@ -224,15 +254,8 @@ def prepare_directories(*directories):
         except FileExistsError:
             pass
 
-def watch_mtab(mtabHandler):
-    wm = pyinotify.WatchManager()
-    wm.add_watch(mtabHandler.mtab_path, pyinotify.IN_CLOSE_WRITE)
-    try:
-        pyinotify.ThreadedNotifier(wm, mtabHandler).loop()
-    except KeyboardInterrupt:
-        print()
-
 def main(args):
+    init_logging(debug)
     ap = ArgumentParser()
     ap.add_argument('catalog_directory', type=str, help="""catalog_directory which:
 - contains config.yaml file
@@ -243,12 +266,7 @@ def main(args):
     phantoms_dir = pathjoin(home_path, '.phantoms')
     mount_dir = pathjoin(home_path, 'mount')
     prepare_directories(phantoms_dir, mount_dir)
-    mtabHandler = MtabHandler(remotes, phantoms_dir, mount_dir)
-    try:
-        mtabHandler.check_for_remote_change()
-        watch_mtab(mtabHandler)
-    finally:
-        mtabHandler.close()
+    MtabChecker(remotes, phantoms_dir, mount_dir).run()
     
 if __name__ == '__main__':
     main(sys.argv[1:])
