@@ -6,7 +6,10 @@ Index defined mount points and mount them read-only from cache where the resourc
 Configuration
 =============
 
-*config.yaml* file:
+Configuration should be set in a *config.yaml* file.
+
+Example
+-------
 
 ```yaml
 remotes:
@@ -20,6 +23,22 @@ remotes:
 		type: local
 		path: /local-path
 ```
+
+Types
+-----
+
+- `disk`: any internal or pluged in disk
+- `sshfs`: an ssh connection using sftp
+- `local`: a local directory
+
+Pathes
+------
+
+- for `disk`, a `udev` unique device path using `UUID`, i.e. starting with `/dev/disk/by-uuid/`.
+  `UUID` could be found by running `blkid` command.
+- for `sshfs`, a sshfs parameter url: `[login@]host[,port]:path`.
+  `port` syntax is an addition to sshfs original url.
+- for `local`, a simple real directory path.
 
 Usage
 =====

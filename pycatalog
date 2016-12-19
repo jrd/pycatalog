@@ -13,6 +13,7 @@ from multiprocessing import Process
 from threading import Thread
 import time
 from subprocess import Popen, TimeoutExpired
+from telnetlib import Telnet
 
 
 log = getLogger(__name__)
@@ -59,12 +60,14 @@ class IndexThread(Thread):
         log.debug('index thread to %s stopped' % self._dir)
 
     def _compute_last_modif(self):
-        last_modif = os.stat(pathjoin(self._dir, '.')).st_mtime_ns
-        if last_modif == 0:  # fat system
-            for f in os.listdir(self._dir):
-                last_modif += os.stat(pathjoin(self._dir, f)).st_mtime_ns
-        return last_modif
-        
+        try:
+            last_modif = os.stat(pathjoin(self._dir, '.')).st_mtime_ns
+            if last_modif == 0:  # fat system
+                for f in os.listdir(self._dir):
+                    last_modif += os.stat(pathjoin(self._dir, f)).st_mtime_ns
+            return last_modif
+        except OSError:
+            return 0
 
     def _try_indexing(self):
         if not exists(self._dir):
@@ -106,9 +109,9 @@ class IndexThread(Thread):
         self.join()
 
 
-class MtabChecker:
-    mtab_path = '/proc/mounts'
-    mtab_field_sep = ' '
+class MountsChecker:
+    proc_mounts_path = '/proc/mounts'
+    field_sep = ' '
 
     def __init__(self, remotes, phantoms_dir, mount_dir):
         self._remotes = remotes
@@ -116,6 +119,26 @@ class MtabChecker:
         self._mount_dir = mount_dir
         self._phantom_processes = {}
         self._index_threads = {}
+        self._prepare_directories(phantoms_dir, mount_dir)
+        self._delete_old_symlinks()
+        self._create_local_connections()
+
+    def _prepare_directories(self, *directories):
+        for directory in directories:
+            try:
+                os.mkdir(directory)
+            except FileExistsError:
+                pass
+
+    def _delete_old_symlinks(self):
+        for entry in os.listdir(self._mount_dir):
+            f= pathjoin(self._mount_dir, entry)
+            if islink(f):
+                os.unlink(f)
+
+    def _create_local_connections(self):
+        for name, path in [(remote['name'], remote['path']) for remote in self._remotes if remote['type'] == 'local']:
+            self._create_local_connection(name, path)
 
     def run(self):
         h = 0
@@ -125,11 +148,11 @@ class MtabChecker:
                     time.sleep(1)
                 except KeyboardInterrupt:
                     break
-                new_h = hash(open(self.mtab_path).read())
+                new_h = hash(open(self.proc_mounts_path).read())
                 if new_h != h:
                     h = new_h
-                    log.debug('mtab changed')
-                    self.check_for_remote_change()
+                    log.debug('/proc/mounts changed')
+                    self.check_for_connection_change()
         finally:
             self._close()
 
@@ -144,15 +167,13 @@ class MtabChecker:
             time.sleep(0.1)
         self._index_threads = {}
 
-    def check_for_remote_change(self):
+    def check_for_connection_change(self):
         for remote in self._remotes:
             (rtype, rname, rpath) = (remote['type'], remote['name'], remote['path'])
             if rtype == 'disk':
-                self._check_disk_change(rname, rpath)
-            elif rtype == 'fuse':
-                self._check_fuse_change(rname, rpath)
-            elif rtype == 'local':
-                self._check_local_change(rname, rpath)
+                self._check_disk_connection_change(rname, rpath)
+            elif rtype == 'sshfs':
+                self._check_sshfs_connection_change(rname, rpath)
     
     def _mount_phantomfs(self, name):
         if name in self._phantom_processes:
@@ -191,29 +212,57 @@ class MtabChecker:
                 pass
             del(self._phantom_processes[name])
 
-    def _check_disk_change(self, name, path):
-        mounted = False
-        if exists(path):
-            path = realpath(path)
-            mount_points = [line.strip().split(self.mtab_field_sep)[1] for line in open(self.mtab_path).readlines() if line.startswith(path + self.mtab_field_sep)]
+    def _is_not_available(self, name, path, path_exists_fct, real_path_fct):
+        mount_point = None
+        if path_exists_fct(path):
+            rpath = real_path_fct(path)
+            mount_points = [line.strip().split(self.field_sep)[1] for line in open(self.proc_mounts_path).readlines() if line.startswith(rpath + self.field_sep)]
             if mount_points:
                 mount_point = mount_points[0]
                 self._umount_phantomfs(name)
                 self._create_symlink(name, mount_point)
                 self._index(name, mount_point)
-                mounted = True
-        if not mounted:
-            if name in self._index_threads:
-                self._index_threads[name].terminate()
-                del(self._index_threads[name])
-            if self._mount_phantomfs(name):
-                self._create_symlink(name, pathjoin(self._phantoms_dir, name))
+        return mount_point is None
+
+    def _switch_to_phantomfs(self, name):
+        if name in self._index_threads:
+            self._index_threads[name].terminate()
+            del(self._index_threads[name])
+        if self._mount_phantomfs(name):
+            self._create_symlink(name, pathjoin(self._phantoms_dir, name))
+
+    def _check_disk_connection_change(self, name, path):
+        if self._is_not_available(name, path, exists, realpath):
+            self._switch_to_phantomfs(name)
+
+    def _parse_sshfs_url(self, url):
+        (login, url) = url.split('@') if '@' in url else (None, url)
+        (hostport, path) = url.split(':') if ':' in url else (None, None)
+        (host, port) = hostport.split(',') if hostport and ',' in hostport else (hostport, '22')
+        return login, host, int(port), path
+
+    def _get_sshfs_url(self, login, host, port, path):
+        return "{login}{host}{port}:{path}".format(login=login + '@' if login else '', host=host, port=',' + port if port != 22 else '', path=path)
     
-    def _check_fuse_change(self, name, path):
-        pass  # TODO
+    def _check_sshfs_connection_change(self, name, url):
+        def connected(url):
+            (login, host, port, path) = self._parse_sshfs_url(url)
+            if host is None:
+                return
+            host_connected = True
+            try:
+                t = Telnet()
+                t.open(host, port)
+                t.close()
+            except OSError:
+                host_connected = False
+            return host_connected
+        if self._is_not_available(name, url, connected, lambda url: self._get_sshfs_url(*self._parse_sshfs_url(url))):
+            self._switch_to_phantomfs(name)
     
-    def _check_local_change(self, name, path):
-        pass  # TODO
+    def _create_local_connection(self, name, path):
+        if exists(path):
+            self._create_symlink(name, path)
 
     def _create_symlink(self, name, mount_point):
         symlink = pathjoin(self._mount_dir, name)
@@ -247,13 +296,6 @@ def load_config(home_path):
     with open(config_path, 'r', encoding='utf8') as f:
         return pureyaml.load(f.read())['remotes']
 
-def prepare_directories(*directories):
-    for directory in directories:
-        try:
-            os.mkdir(directory)
-        except FileExistsError:
-            pass
-
 def main(args):
     init_logging(debug)
     ap = ArgumentParser()
@@ -265,8 +307,8 @@ def main(args):
     remotes = load_config(home_path)
     phantoms_dir = pathjoin(home_path, '.phantoms')
     mount_dir = pathjoin(home_path, 'mount')
-    prepare_directories(phantoms_dir, mount_dir)
-    MtabChecker(remotes, phantoms_dir, mount_dir).run()
+    mc = MountsChecker(remotes, phantoms_dir, mount_dir)
+    mc.run()
     
 if __name__ == '__main__':
     main(sys.argv[1:])
